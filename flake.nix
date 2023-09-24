@@ -23,6 +23,7 @@
           rustfmt
           clippy
           mold
+          libiconv
         ];
 
         buildInputs = with pkgs; [
