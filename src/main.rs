@@ -1,11 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use blake3::{Hash, Hasher};
+use rayon::prelude::*;
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    fs::FileType,
+    path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering, AtomicBool},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
     },
     time::{Duration, UNIX_EPOCH},
 };
@@ -15,7 +17,7 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
 use clap::Parser;
 
@@ -90,7 +92,7 @@ async fn main() -> Result<()> {
             let path = file_info.path();
             match path.is_dir() {
                 true => remove_dir_all(&path).await?,
-                false => match path.is_file() {
+                false => match file_type(&path).await.unwrap().is_file() {
                     true => remove_file(&path).await?,
                     // not really sure what to do here
                     false => todo!(),
@@ -104,26 +106,43 @@ async fn main() -> Result<()> {
             work_dir.display(),
             backup_dir.display()
         );
-        for file_info in WalkDir::new(&backup_dir)
-            .follow_links(true)
-            .into_iter()
-            .filter(|file_info| match file_info {
-                Ok(file_info) => file_info.path().is_file(),
-                Err(_) => false,
-            })
-            .into_iter()
-        {
-            let file_info = file_info?;
+        for file_info in recursive_dir(&backup_dir) {
             let path = file_info.path();
-            copy_to_dst(path.to_path_buf(), backup_dir.clone(), work_dir.clone())
-                .await
-                .with_context(|| anyhow!("Error copying file for initialization"))?;
+
+            let file_type = file_type(&path).await.with_context(|| {
+                anyhow!(
+                    "Error getting file type of file {} for initialization",
+                    file_info.path().display()
+                )
+            })?;
+
+            if file_type.is_file() || file_type.is_symlink() {
+                copy_to_dst(path.to_path_buf(), backup_dir.clone(), work_dir.clone())
+                    .await
+                    .with_context(|| anyhow!("Error copying file for initialization"))?;
+            } else if file_type.is_dir() {
+                let work_dir_path = convert_backup_path_to_work_path(
+                    path.to_path_buf(),
+                    work_dir.clone(),
+                    backup_dir.clone(),
+                )?;
+                fs::create_dir_all(work_dir_path).await?;
+            }
         }
 
         println!("Initialized {}!", work_dir.display());
     }
 
+    let work_dir_clone = work_dir.clone();
+    let backup_dir_clone = backup_dir.clone();
+
+    tokio::task::spawn(async move {
+        delete_files(work_dir_clone, backup_dir_clone)
+            .await
+            .unwrap()
+    });
     tokio::task::spawn(async move { copy_files(work_dir, backup_dir).await.unwrap() });
+
     tokio::signal::ctrl_c().await?;
 
     SHOULD_SHUTDOWN.store(true, Ordering::Relaxed);
@@ -141,10 +160,46 @@ async fn backup_files() {
 }
 
 struct FileSyncInfo {
-    /// The time the file was last modified to in Unix time
-    modify_time: Arc<AtomicU64>,
     /// The tokio task running in a loop that ensures the time is kept in sync
     sync_task: JoinHandle<()>,
+}
+
+async fn delete_files(work_dir: PathBuf, backup_dir: PathBuf) -> Result<()> {
+    loop {
+        for file_info in recursive_dir(&backup_dir).into_iter() {
+            // First, check if the path exists in backup_dir
+            if fs::try_exists(&file_info.path()).await.unwrap_or(false) {
+                continue;
+            }
+            // If a path exists in backup_dir, but doesn't exist in work_dr, that means the file was deleted in work_dir
+            let work_dir_path = convert_backup_path_to_work_path(
+                file_info.path().to_path_buf(),
+                work_dir.clone(),
+                backup_dir.clone(),
+            )
+            .unwrap();
+
+            if !fs::try_exists(&work_dir_path).await.unwrap_or(false) {
+                let file_type = file_type(file_info.path())
+                    .await
+                    .with_context(|| {
+                        anyhow!(
+                            "Error getting file type for {} for deletion",
+                            work_dir_path.display()
+                        )
+                    })
+                    .unwrap();
+
+                if file_type.is_file() || file_type.is_symlink() {
+                    fs::remove_file(file_info.path()).await.unwrap();
+                } else if file_type.is_dir() {
+                    fs::remove_dir_all(file_info.path()).await.unwrap();
+                } else {
+                    panic!("This is a bug, we're missing some file type")
+                }
+            }
+        }
+    }
 }
 
 // TODO: gitignore
@@ -155,20 +210,13 @@ async fn copy_files(work_dir: PathBuf, backup_dir: PathBuf) -> Result<()> {
 
     // Starts any handles that are necessary
     loop {
-        for file_info in WalkDir::new(&work_dir)
-            .follow_links(true)
-            .into_iter()
-            .filter(|file_info| match file_info {
-                Ok(file_info) => file_info.path().is_file(),
-                Err(_) => false,
-            })
-        {
-            //FIXME: unwrap
-            let file_info = file_info.unwrap();
+        for file_info in recursive_dir(&work_dir) {
+            if !file_type(file_info.path()).await.unwrap().is_file() {
+                continue;
+            }
 
             match handles.get(file_info.path()) {
                 Some(FileSyncInfo {
-                    modify_time: _,
                     sync_task,
                 }) => {
                     // Respawn the sync task next loop iteration if it's crashed or finished
@@ -177,35 +225,52 @@ async fn copy_files(work_dir: PathBuf, backup_dir: PathBuf) -> Result<()> {
                     }
                 }
                 None => {
-                    let metadata = fs::metadata(file_info.path()).await.unwrap();
-                    let modify_time = Arc::new(AtomicU64::new(
-                        metadata
-                            .modified()
-                            .unwrap()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                    ));
+                    let backup_path = convert_work_path_to_backup_path(
+                        file_info.path().to_path_buf(),
+                        work_dir.clone(),
+                        backup_dir.clone(),
+                    )
+                    .unwrap();
+                    match fs::metadata(backup_path).await {
+                        Ok(metadata) => {
+                            let modify_time = Arc::new(AtomicU64::new(
+                                metadata
+                                    .modified()
+                                    .unwrap()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs(),
+                            ));
 
-                    let modify_time_clone = modify_time.clone();
-                    let path = file_info.path().to_path_buf();
-                    let work_dir = work_dir.clone();
-                    let backup_dir = backup_dir.clone();
+                            let modify_time_clone = modify_time.clone();
+                            let path = file_info.path().to_path_buf();
+                            let work_dir = work_dir.clone();
+                            let backup_dir = backup_dir.clone();
 
-                    let sync_task = tokio::task::spawn(spawn_sync_task(
-                        path,
-                        work_dir,
-                        backup_dir,
-                        modify_time_clone,
-                    ));
+                            let sync_task = tokio::task::spawn(spawn_sync_task(
+                                path,
+                                work_dir,
+                                backup_dir,
+                                modify_time_clone,
+                            ));
 
-                    handles.insert(
-                        file_info.into_path(),
-                        FileSyncInfo {
-                            modify_time,
-                            sync_task,
-                        },
-                    );
+                            handles.insert(
+                                file_info.into_path(),
+                                FileSyncInfo {
+                                    sync_task,
+                                },
+                            );
+                        }
+                        Err(err) => {
+                            match err.kind() {
+                                io::ErrorKind::NotFound => {
+                                    //TODO: catch this
+                                    copy_to_dst(file_info.path().to_path_buf(), work_dir.clone(), backup_dir.clone()).await;
+                                },
+                                _ => todo!("{err}"),
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -236,7 +301,7 @@ async fn spawn_sync_task(
                     .unwrap()
                     .as_secs();
 
-                if current_modify_time > modify_time.load(Ordering::Relaxed) {
+                if current_modify_time != modify_time.load(Ordering::Relaxed) {
                     modify_time.store(current_modify_time, Ordering::Relaxed);
 
                     if let Err(err) =
@@ -255,31 +320,10 @@ async fn spawn_sync_task(
                 }
             }
             Err(err) => {
-                match err.kind() {
-                    io::ErrorKind::NotFound => {
-                        if let Err(err) =
-                            copy_to_dst(path.clone(), work_dir.clone(), backup_dir.clone()).await
-                        {
-                            match err.downcast_ref::<io::Error>() {
-                                Some(err) => {
-                                    // Ignore file not found errors
-                                    if err.kind() != io::ErrorKind::NotFound {
-                                        Err(anyhow!(
-                                            "Error initializing file in {} due to io::Error: {err}",
-                                            backup_dir.display()
-                                        ))
-                                        .unwrap()
-                                    }
-                                }
-                                None => Err(anyhow!(
-                                    "Error initializing file in {}: {err}",
-                                    backup_dir.display()
-                                ))
-                                .unwrap(),
-                            }
-                        }
-                    }
-                    _ => todo!(),
+                if err.kind() == io::ErrorKind::NotFound {
+                    return
+                } else {
+                    todo!("Handle {err} correctly");
                 }
             }
         };
@@ -288,11 +332,15 @@ async fn spawn_sync_task(
             return;
         }
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
-async fn copy_to_dst(path: PathBuf, work_dir: PathBuf, backup_dir: PathBuf) -> Result<()> {
+fn convert_work_path_to_backup_path(
+    path: PathBuf,
+    work_dir: PathBuf,
+    backup_dir: PathBuf,
+) -> Result<PathBuf> {
     let new_path = path.strip_prefix(&work_dir).with_context(|| {
         anyhow!(
             "Error stripping prefix {} from {}",
@@ -302,6 +350,29 @@ async fn copy_to_dst(path: PathBuf, work_dir: PathBuf, backup_dir: PathBuf) -> R
     })?;
     let mut dst_path = backup_dir.clone();
     dst_path.push(new_path);
+
+    Ok(dst_path)
+}
+fn convert_backup_path_to_work_path(
+    path: PathBuf,
+    work_dir: PathBuf,
+    backup_dir: PathBuf,
+) -> Result<PathBuf> {
+    let new_path = path.strip_prefix(&backup_dir).with_context(|| {
+        anyhow!(
+            "Error stripping prefix {} from {}",
+            backup_dir.display(),
+            path.display()
+        )
+    })?;
+    let mut dst_path = work_dir.clone();
+    dst_path.push(new_path);
+
+    Ok(dst_path)
+}
+
+async fn copy_to_dst(path: PathBuf, work_dir: PathBuf, backup_dir: PathBuf) -> Result<()> {
+    let dst_path = convert_work_path_to_backup_path(path.clone(), work_dir, backup_dir)?;
 
     let backup_dir = {
         let mut dst_path = dst_path.clone();
@@ -330,7 +401,11 @@ async fn copy_to_dst(path: PathBuf, work_dir: PathBuf, backup_dir: PathBuf) -> R
     Ok(())
 }
 
-pub fn hash_directory(dir: PathBuf) -> Result<Hash> {
+async fn file_type<P: AsRef<Path>>(path: P) -> Result<FileType> {
+    Ok(fs::metadata(path).await?.file_type())
+}
+
+pub fn hash_directory(dir: PathBuf) -> Result<HashMap<PathBuf, Hash>> {
     if !dir.exists() {
         return Err(anyhow!(
             "Directory {} does not exist for hashing",
@@ -342,33 +417,29 @@ pub fn hash_directory(dir: PathBuf) -> Result<Hash> {
         return Err(anyhow!("Path {} is not a direectory!", dir.display()));
     }
 
-    let hasher: Arc<Mutex<Hasher>> = Arc::new(Mutex::new(Hasher::new()));
+    let file_paths: Vec<_> = recursive_dir(dir.as_ref()).collect();
 
-    let mut file_paths: Vec<_> = WalkDir::new(&dir)
-        .follow_links(true)
-        .into_iter()
-        .filter(|file_info| match file_info {
-            Ok(file_info) => file_info.path().is_file(),
-            Err(_) => false,
+    // This is just a poor man's try_collect
+    let res: Result<Vec<_>> = file_paths
+        .into_par_iter()
+        .map(|file_info| {
+            let mut hasher = Hasher::new();
+
+            let mut file = std::fs::File::open(file_info.path())?;
+            std::io::copy(&mut file, &mut hasher)?;
+
+            Ok((file_info.path().to_path_buf(), hasher.finalize()))
         })
-        .filter_map(|file_info| file_info.ok())
         .collect();
 
-    file_paths.sort_by(|file_info, file_info2| {
-        file_info
-            .path()
-            .to_string_lossy()
-            .to_lowercase()
-            .cmp(&file_info2.path().to_string_lossy().to_lowercase())
-    });
+    Ok(res?.into_iter().collect())
+}
 
-    for file_info in file_paths.into_iter() {
-        let hasher = hasher.clone();
-
-        let mut file = std::fs::File::open(file_info.path())?;
-        std::io::copy(&mut file, &mut *hasher.lock().unwrap())?;
-    }
-
-    let hasher = &hasher.lock().unwrap();
-    Ok(hasher.finalize())
+fn recursive_dir(dir: &Path) -> impl Iterator<Item = DirEntry> {
+    WalkDir::new(dir)
+        .follow_links(false)
+        .contents_first(true)
+        .into_iter()
+        .filter_map(|p| p.ok())
+        .filter(|p| p.file_type().is_file())
 }
