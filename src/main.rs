@@ -168,7 +168,7 @@ async fn delete_files(work_dir: PathBuf, backup_dir: PathBuf) -> Result<()> {
     loop {
         for file_info in recursive_dir(&backup_dir).into_iter() {
             // First, check if the path exists in backup_dir
-            if fs::try_exists(&file_info.path()).await.unwrap_or(false) {
+            if !fs::try_exists(&file_info.path()).await.unwrap() {
                 continue;
             }
             // If a path exists in backup_dir, but doesn't exist in work_dr, that means the file was deleted in work_dir
@@ -179,7 +179,7 @@ async fn delete_files(work_dir: PathBuf, backup_dir: PathBuf) -> Result<()> {
             )
             .unwrap();
 
-            if !fs::try_exists(&work_dir_path).await.unwrap_or(false) {
+            if !fs::try_exists(&work_dir_path).await.unwrap() {
                 let file_type = file_type(file_info.path())
                     .await
                     .with_context(|| {
@@ -199,6 +199,8 @@ async fn delete_files(work_dir: PathBuf, backup_dir: PathBuf) -> Result<()> {
                 }
             }
         }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
