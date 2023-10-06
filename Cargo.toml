@@ -8,7 +8,6 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "signal", "sync", "time", "io-util"] }
-walkdir = "2"
 blake3 = "1"
 ignore = "0.4"
 rayon = "1"

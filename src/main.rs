@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use blake3::{Hash, Hasher};
+use ignore::DirEntry;
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
@@ -17,7 +18,6 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
-use walkdir::{DirEntry, WalkDir};
 
 use clap::Parser;
 
@@ -200,7 +200,7 @@ async fn delete_files(work_dir: PathBuf, backup_dir: PathBuf) -> Result<()> {
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -218,9 +218,7 @@ async fn copy_files(work_dir: PathBuf, backup_dir: PathBuf) -> Result<()> {
             }
 
             match handles.get(file_info.path()) {
-                Some(FileSyncInfo {
-                    sync_task,
-                }) => {
+                Some(FileSyncInfo { sync_task }) => {
                     // Respawn the sync task next loop iteration if it's crashed or finished
                     if sync_task.is_finished() {
                         handles.remove(file_info.path());
@@ -256,19 +254,19 @@ async fn copy_files(work_dir: PathBuf, backup_dir: PathBuf) -> Result<()> {
                                 modify_time_clone,
                             ));
 
-                            handles.insert(
-                                file_info.into_path(),
-                                FileSyncInfo {
-                                    sync_task,
-                                },
-                            );
+                            handles.insert(file_info.into_path(), FileSyncInfo { sync_task });
                         }
                         Err(err) => {
                             match err.kind() {
                                 io::ErrorKind::NotFound => {
                                     //TODO: catch this
-                                    copy_to_dst(file_info.path().to_path_buf(), work_dir.clone(), backup_dir.clone()).await;
-                                },
+                                    copy_to_dst(
+                                        file_info.path().to_path_buf(),
+                                        work_dir.clone(),
+                                        backup_dir.clone(),
+                                    )
+                                    .await;
+                                }
                                 _ => todo!("{err}"),
                             }
                         }
@@ -323,7 +321,7 @@ async fn spawn_sync_task(
             }
             Err(err) => {
                 if err.kind() == io::ErrorKind::NotFound {
-                    return
+                    return;
                 } else {
                     todo!("Handle {err} correctly");
                 }
@@ -334,7 +332,7 @@ async fn spawn_sync_task(
             return;
         }
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -438,10 +436,13 @@ pub fn hash_directory(dir: PathBuf) -> Result<HashMap<PathBuf, Hash>> {
 }
 
 fn recursive_dir(dir: &Path) -> impl Iterator<Item = DirEntry> {
-    WalkDir::new(dir)
+    ignore::WalkBuilder::new(dir)
+        .hidden(false)
         .follow_links(false)
-        .contents_first(true)
-        .into_iter()
-        .filter_map(|p| p.ok())
-        .filter(|p| p.file_type().is_file())
+        .build()
+        .filter_map(|f| f.ok())
+        .filter(|f| match f.file_type() {
+            Some(file_type) => file_type.is_file(),
+            None => false,
+        })
 }
