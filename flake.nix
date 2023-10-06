@@ -16,16 +16,16 @@
     {
       devShells.default = pkgs.mkShell rec {
         nativeBuildInputs = with pkgs; [
-          cmake
           pkg-config
+        ];
+
+        buildInputs = with pkgs; [
+          cmake
           rustc
           cargo
           rustfmt
           clippy
           mold
-        ];
-
-        buildInputs = with pkgs; [
         ];
 
         RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
