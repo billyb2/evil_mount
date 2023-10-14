@@ -36,13 +36,17 @@ struct Args {
 
 static SHOULD_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+enum TruthSourceKind {
+    WorkDir,
+    BackupDir,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let Args {
         work_dir,
         backup_dir,
     } = Args::parse();
-
     // Ensure that source_dir and backup_dir are folders
     if !work_dir.is_dir() {
         return Err(anyhow!("work_dir must be a directory!"));
@@ -51,87 +55,75 @@ async fn main() -> Result<()> {
         return Err(anyhow!("backup_dir must be a directory!"));
     }
 
-    println!(
-        "Checking if {} and {} are equal",
-        work_dir.display(),
-        backup_dir.display()
-    );
+    println!("Checking the modification times of the directories",);
 
-    let work_dir_clone = work_dir.clone();
-    let backup_dir_clone = backup_dir.clone();
+    let work_dir_modify_time = dir_modify_time(&work_dir).await?;
+    let backup_dir_modify_time = dir_modify_time(&backup_dir).await?;
 
-    let start = Instant::now();
+    let (source_of_truth, dir_to_init, truth_source_kind) =
+        match work_dir_modify_time > backup_dir_modify_time {
+            true => (&work_dir, &backup_dir, TruthSourceKind::WorkDir),
+            false => (&backup_dir, &work_dir, TruthSourceKind::BackupDir),
+        };
 
-    let (work_dir_hash, backup_dir_hash) = tokio::join!(
-        tokio::task::spawn_blocking(move || hash_directory(work_dir_clone)),
-        tokio::task::spawn_blocking(move || hash_directory(backup_dir_clone)),
-    );
-
-    let work_dir_hash = work_dir_hash??;
-    let backup_dir_hash = backup_dir_hash??;
-
-    println!(
-        "Done! Took {} seconds",
-        Instant::now().duration_since(start).as_secs_f32()
-    );
-
-    if work_dir_hash == backup_dir_hash {
-        println!(
-            "{} == {}, skipping initialization",
-            work_dir.display(),
-            backup_dir.display()
-        );
-    } else {
-        println!("Clearing {}...", work_dir.display());
-        while let Ok(Some(file_info)) = fs::read_dir(&work_dir)
-            .await
-            .with_context(|| anyhow!("Error reading the source directory"))?
-            .next_entry()
-            .await
-        {
-            let path = file_info.path();
-            match path.is_dir() {
-                true => remove_dir_all(&path).await?,
-                false => match file_type(&path).await.unwrap().is_file() {
-                    true => remove_file(&path).await?,
-                    // not really sure what to do here
-                    false => todo!(),
-                },
-            };
-        }
-        println!("Cleared {}!", work_dir.display());
-
-        println!(
-            "Initializing {} with the contents of {}...",
-            work_dir.display(),
-            backup_dir.display()
-        );
-        for file_info in recursive_dir(&backup_dir) {
-            let path = file_info.path();
-
-            let file_type = file_type(&path).await.with_context(|| {
-                anyhow!(
-                    "Error getting file type of file {} for initialization",
-                    file_info.path().display()
-                )
-            })?;
-
-            if file_type.is_file() || file_type.is_symlink() {
-                copy_to_dst(path.to_path_buf(), backup_dir.clone(), work_dir.clone())
-                    .await
-                    .with_context(|| anyhow!("Error copying file for initialization"))?;
-            } else if file_type.is_dir() {
-                let work_dir_path = convert_backup_path_to_work_path(
-                    path.to_path_buf(),
-                    work_dir.clone(),
-                    backup_dir.clone(),
-                )?;
-                fs::create_dir_all(work_dir_path).await?;
-            }
-        }
-
-        println!("Initialized {}!", work_dir.display());
+    println!("Clearing {}...", dir_to_init.display());
+    while let Ok(Some(file_info)) = fs::read_dir(&dir_to_init)
+        .await
+        .with_context(|| anyhow!("Error reading the source directory"))?
+        .next_entry()
+        .await
+    {
+        let path = file_info.path();
+        match path.is_dir() {
+            true => remove_dir_all(&path).await.with_context(|| anyhow!("Error removing directory {path:?}"))?,
+            false => match file_type(&path).await.unwrap().is_file() {
+                true => remove_file(&path).await.with_context(|| anyhow!("Error removing file {path:?}"))?,
+                // not really sure what to do here
+                false => todo!(),
+            },
+        };
     }
+    println!("Cleared {}!", dir_to_init.display());
+
+    println!(
+        "Initializing {} with the contents of {}...",
+        dir_to_init.display(),
+        source_of_truth.display()
+    );
+    for file_info in recursive_dir(&source_of_truth) {
+        let path = file_info.path();
+
+        let file_type = file_type(&path).await.with_context(|| {
+            anyhow!(
+                "Error getting file type of file {} for initialization",
+                file_info.path().display()
+            )
+        })?;
+
+        if file_type.is_file() || file_type.is_symlink() {
+            copy_to_dst(
+                path.to_path_buf(),
+                source_of_truth.clone(),
+                dir_to_init.clone(),
+            )
+            .await
+            .with_context(|| anyhow!("Error copying file for initialization"))?;
+        } else if file_type.is_dir() {
+            let convert_dir_fn = match truth_source_kind {
+                TruthSourceKind::WorkDir => convert_work_path_to_backup_path,
+                TruthSourceKind::BackupDir => convert_backup_path_to_work_path,
+            };
+
+            let dir_to_init_path = convert_dir_fn(
+                path.to_path_buf(),
+                dir_to_init.clone(),
+                source_of_truth.clone(),
+            )?;
+            fs::create_dir_all(dir_to_init_path).await?;
+        }
+    }
+
+    println!("Initialized {}!", dir_to_init.display());
 
     let work_dir_clone = work_dir.clone();
     let backup_dir_clone = backup_dir.clone();
@@ -419,8 +411,7 @@ pub fn hash_directory(dir: PathBuf) -> Result<HashMap<PathBuf, Hash>> {
 
     let file_paths: Vec<_> = recursive_dir(dir.as_ref()).collect();
 
-    // This is just a poor man's try_collect
-    let res: Result<Vec<_>> = file_paths
+    file_paths
         .into_par_iter()
         .map(|file_info| {
             let mut hasher = Hasher::new();
@@ -430,9 +421,7 @@ pub fn hash_directory(dir: PathBuf) -> Result<HashMap<PathBuf, Hash>> {
 
             Ok((file_info.path().to_path_buf(), hasher.finalize()))
         })
-        .collect();
-
-    Ok(res?.into_iter().collect())
+        .collect::<Result<HashMap<PathBuf, Hash>>>()
 }
 
 fn recursive_dir(dir: &Path) -> impl Iterator<Item = DirEntry> {
@@ -445,4 +434,30 @@ fn recursive_dir(dir: &Path) -> impl Iterator<Item = DirEntry> {
             Some(file_type) => file_type.is_file(),
             None => false,
         })
+}
+
+async fn dir_modify_time(work_dir: &Path) -> Result<u64> {
+    let meta_times: Result<Vec<u64>> =
+        futures::future::try_join_all(recursive_dir(work_dir).map(|dir_entry| async move {
+            let file_path = {
+                Ok(fs::metadata(dir_entry.path())
+                    .await?
+                    .modified()?
+                    .duration_since(UNIX_EPOCH)?
+                    .as_secs())
+            };
+
+            file_path
+        }))
+        .await;
+
+    meta_times?
+        .into_iter()
+        .reduce(
+            |newest_mod_time, mod_time| match mod_time > newest_mod_time {
+                true => mod_time,
+                false => newest_mod_time,
+            },
+        )
+        .ok_or_else(|| anyhow!("Directory is empty"))
 }
